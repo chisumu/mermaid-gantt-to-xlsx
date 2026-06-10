@@ -1,0 +1,14 @@
+{
+  "name": "mermaid-gantt-to-excel",
+  "version": "1.0.0",
+  "description": "Convert Mermaid gantt charts to Excel spreadsheets",
+  "bin": {
+    "gantt2xlsx": "convert.js"
+  },
+  "scripts": {
+    "start": "node convert.js"
+  },
+  "dependencies": {
+    "xlsx": "^0.18.5"
+  }
+}
