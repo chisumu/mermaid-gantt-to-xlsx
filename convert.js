@@ -159,6 +159,7 @@ function parseTask(label, meta, ctx) {
     tags.push(fields.shift().toLowerCase());
   }
 
+  // FIXME: Graduate these to actual utilities
   const isDate = s => ctx.parseDate(s) !== null;
   const isAfter = s => /^after\b/i.test(s);
   const isDur = s => parseDuration(s) !== null;
@@ -183,6 +184,7 @@ function parseTask(label, meta, ctx) {
   if (startField) {
     if (isAfter(startField)) {
       const refs = startField.replace(/^after\s+/i, '').split(/\s+/);
+
       let maxEnd = null;
       for (const r of refs) {
         const t = ctx.tasksById[r];
@@ -210,7 +212,7 @@ function parseTask(label, meta, ctx) {
 
   const durationDays = (start && end) ? (end.getTime() - start.getTime()) / MS_PER_DAY : null;
 
-  return { section: ctx.section, label, id, tags, start, end, durationDays };
+  return { id: id, section: ctx.section, label: label, tags: tags, start: start, end: end, durationDays: durationDays };
 }
 
 // --- Excel output -----------------------------------------------------------
