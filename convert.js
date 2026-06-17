@@ -12,7 +12,7 @@
 
 const fs = require('fs');
 const path = require('path');
-const XLSX = require('xlsx');
+const ExcelJS = require('exceljs');
 
 const TASK_TAGS = ['done', 'active', 'crit', 'milestone'];
 
@@ -217,41 +217,170 @@ function parseTask(label, meta, ctx) {
 
 // --- Excel output -----------------------------------------------------------
 
-function writeWorkbook(chart, outPath) {
-  const header = ['Section', 'Task', 'Start Date', 'End Date', 'Duration (days)', 'Tags'];
-  const rows = chart.tasks.map(t => [
-    t.section,
-    t.label,
-    t.start,
-    t.end,
-    t.durationDays,
-    t.tags.join(', '),
-  ]);
+// Bar fill colours (ARGB) keyed by tag, in priority order. The first tag a
+// task carries that appears here wins; tagless tasks use the default.
+const BAR_COLORS = {
+  crit:      'FFE53935', // red
+  done:      'FF43A047', // green
+  active:    'FF1E88E5', // blue
+  milestone: 'FFFB8C00', // orange
+};
+const DEFAULT_BAR_COLOR = 'FF26A69A'; // teal
+const TAG_PRIORITY = ['crit', 'active', 'done'];
 
-  const ws = XLSX.utils.aoa_to_sheet([header, ...rows], { cellDates: true });
-
-  // Apply a date number format to the Start/End columns (C and D).
-  for (let r = 1; r <= rows.length; r++) {
-    for (const col of ['C', 'D']) {
-      const cell = ws[col + (r + 1)];
-      if (cell && cell.t === 'd') cell.z = 'yyyy-mm-dd';
-    }
+function barColor(task) {
+  if (task.tags.includes('milestone')) return BAR_COLORS.milestone;
+  for (const tag of TAG_PRIORITY) {
+    if (task.tags.includes(tag)) return BAR_COLORS[tag];
   }
+  if (task.tags.includes('done')) return BAR_COLORS.done;
+  return DEFAULT_BAR_COLOR;
+}
 
-  ws['!cols'] = [
-    { wch: 18 }, { wch: 36 }, { wch: 12 }, { wch: 12 }, { wch: 14 }, { wch: 20 },
+// The five fixed info columns shown to the left of the calendar grid.
+const INFO_COLUMNS = [
+  { header: 'Section',         width: 18 },
+  { header: 'Task',            width: 34 },
+  { header: 'Start',           width: 12 },
+  { header: 'End',             width: 12 },
+  { header: 'Days',            width: 7  },
+];
+const FIRST_GRID_COL = INFO_COLUMNS.length + 1; // 1-based column of first date
+
+const DAY = MS_PER_DAY;
+const WEEK = 7 * DAY;
+
+// Choose a calendar granularity so the grid stays a reasonable width.
+function chooseUnit(spanDays) {
+  if (spanDays <= 70) return 'day';
+  if (spanDays <= 540) return 'week';
+  return 'month';
+}
+
+// Floor a date to the start of its unit (UTC).
+function unitStart(date, unit) {
+  const d = new Date(date.getTime());
+  d.setUTCHours(0, 0, 0, 0);
+  if (unit === 'week') {
+    // Snap back to Monday.
+    const dow = (d.getUTCDay() + 6) % 7;
+    d.setUTCDate(d.getUTCDate() - dow);
+  } else if (unit === 'month') {
+    d.setUTCDate(1);
+  }
+  return d;
+}
+
+// Advance a date by one unit (UTC).
+function unitNext(date, unit) {
+  const d = new Date(date.getTime());
+  if (unit === 'day') d.setUTCDate(d.getUTCDate() + 1);
+  else if (unit === 'week') d.setUTCDate(d.getUTCDate() + 7);
+  else d.setUTCMonth(d.getUTCMonth() + 1);
+  return d;
+}
+
+// Build the ordered list of calendar columns spanning [min, max].
+function buildPeriods(min, max, unit) {
+  const periods = [];
+  let cur = unitStart(min, unit);
+  while (cur <= max) {
+    periods.push({ start: cur, end: unitNext(cur, unit) });
+    cur = unitNext(cur, unit);
+  }
+  return periods;
+}
+
+function periodLabel(start, unit) {
+  const y = start.getUTCFullYear();
+  const mo = String(start.getUTCMonth() + 1).padStart(2, '0');
+  const d = String(start.getUTCDate()).padStart(2, '0');
+  if (unit === 'month') return `${y}-${mo}`;
+  return `${mo}-${d}`; // day / week: month-day
+}
+
+async function writeWorkbook(chart, outPath) {
+  // Determine the overall date span from tasks that have dates.
+  let min = null, max = null;
+  for (const t of chart.tasks) {
+    if (t.start && (!min || t.start < min)) min = t.start;
+    if (t.end && (!max || t.end > max)) max = t.end;
+  }
+  const hasGrid = !!(min && max);
+
+  const unit = hasGrid ? chooseUnit((max - min) / DAY) : 'day';
+  const periods = hasGrid ? buildPeriods(min, max, unit) : [];
+
+  const wb = new ExcelJS.Workbook();
+  const sheetName = (chart.title || 'Gantt').replace(/[:\\/?*[\]]/g, ' ').slice(0, 31) || 'Gantt';
+  const ws = wb.addWorksheet(sheetName, {
+    views: [{ state: 'frozen', xSplit: INFO_COLUMNS.length, ySplit: 2 }],
+  });
+
+  // Column widths.
+  ws.columns = [
+    ...INFO_COLUMNS.map(c => ({ width: c.width })),
+    ...periods.map(() => ({ width: unit === 'month' ? 9 : 4 })),
   ];
 
-  const wb = XLSX.utils.book_new();
-  // Sheet names are limited to 31 chars and may not contain : \ / ? * [ ]
-  const sheetName = (chart.title || 'Gantt').replace(/[:\\/?*[\]]/g, ' ').slice(0, 31) || 'Gantt';
-  XLSX.utils.book_append_sheet(wb, ws, sheetName);
-  XLSX.writeFile(wb, outPath, { cellDates: true });
+  // Row 1: title banner across all columns.
+  const lastCol = INFO_COLUMNS.length + periods.length;
+  ws.mergeCells(1, 1, 1, Math.max(lastCol, INFO_COLUMNS.length));
+  const titleCell = ws.getCell(1, 1);
+  titleCell.value = chart.title || 'Gantt';
+  titleCell.font = { bold: true, size: 14 };
+  titleCell.alignment = { vertical: 'middle' };
+
+  // Row 2: header (info columns + date labels).
+  const headerRow = ws.getRow(2);
+  INFO_COLUMNS.forEach((c, i) => { headerRow.getCell(i + 1).value = c.header; });
+  periods.forEach((p, i) => {
+    const cell = headerRow.getCell(FIRST_GRID_COL + i);
+    cell.value = periodLabel(p.start, unit);
+    cell.alignment = { textRotation: 90, horizontal: 'center' };
+  });
+  headerRow.eachCell(cell => {
+    cell.font = { bold: true };
+    cell.fill = { type: 'pattern', pattern: 'solid', fgColor: { argb: 'FFECEFF1' } };
+    cell.border = { bottom: { style: 'thin', color: { argb: 'FFB0BEC5' } } };
+  });
+
+  // Task rows.
+  chart.tasks.forEach((t, idx) => {
+    const r = ws.getRow(3 + idx);
+    r.getCell(1).value = t.section || '';
+    r.getCell(2).value = t.label;
+    if (t.start) { r.getCell(3).value = t.start; r.getCell(3).numFmt = 'yyyy-mm-dd'; }
+    if (t.end)   { r.getCell(4).value = t.end;   r.getCell(4).numFmt = 'yyyy-mm-dd'; }
+    if (t.durationDays != null) r.getCell(5).value = t.durationDays;
+
+    if (!hasGrid || !t.start) return;
+    const color = barColor(t);
+    const isMilestone = t.tags.includes('milestone') || (t.end && +t.end === +t.start);
+
+    periods.forEach((p, i) => {
+      // A period is part of the bar if it overlaps [start, end). Milestones
+      // (zero-length) mark the single period that contains their date.
+      const overlaps = isMilestone
+        ? (t.start >= p.start && t.start < p.end)
+        : (t.start < p.end && t.end > p.start);
+      if (!overlaps) return;
+      const cell = r.getCell(FIRST_GRID_COL + i);
+      cell.fill = { type: 'pattern', pattern: 'solid', fgColor: { argb: color } };
+      if (isMilestone) {
+        cell.value = '◆'; // ◆
+        cell.font = { color: { argb: 'FFFFFFFF' }, bold: true };
+        cell.alignment = { horizontal: 'center' };
+      }
+    });
+  });
+
+  await wb.xlsx.writeFile(outPath);
 }
 
 // --- Main -------------------------------------------------------------------
 
-function main() {
+async function main() {
   const args = process.argv.slice(2);
   if (args.length < 1) {
     fail('usage: node convert.js <input.md> [output.xlsx]');
@@ -266,8 +395,8 @@ function main() {
 
   if (chart.tasks.length === 0) fail('no tasks found in the gantt chart');
 
-  writeWorkbook(chart, outPath);
+  await writeWorkbook(chart, outPath);
   console.log(`Wrote ${chart.tasks.length} task(s) to ${path.resolve(outPath)}`);
 }
 
-main();
+main().catch(err => fail(err && err.message ? err.message : String(err)));
